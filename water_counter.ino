@@ -1,6 +1,7 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include <FastBot.h>
+#include <HTTPClient.h>
 
 // ====== ВПИШИ СЮДА ======
 static const char* WIFI_SSID = "<SSID>";
@@ -24,14 +25,19 @@ static const uint32_t HIGH_REARM_MS  = 200;  // HIGH должен держать
 // "Антидребезг" как минимальный интервал между принятыми тиками (в мс)
 static const uint32_t DEFAULT_DEBOUNCE_MS = 2000; // для 10л/имп нормально 2000..5000
 
-// Сохранение в NVS
-static const uint32_t SAVE_EVERY_PULSES = 3;
-static const uint32_t SAVE_EVERY_MS     = 60 * 1000;
+// Сохранение в NVS (дефолты)
+static const uint32_t DEFAULT_SAVE_EVERY_PULSES = 3;
+static const uint32_t DEFAULT_SAVE_EVERY_MS     = 60 * 1000;
 
 FastBot bot(BOT_TOKEN);
 Preferences prefs;
 
 static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+SemaphoreHandle_t report_cfg_mutex = nullptr;
+QueueHandle_t report_queue = nullptr;
+
+static const uint8_t REPORT_EVENT_CHANGED = 1;
+static const uint8_t REPORT_EVENT_FORCE = 2;
 
 // сырые тики
 volatile uint64_t cold_pulses = 0;
@@ -64,8 +70,37 @@ volatile uint32_t hot_irq  = 0;
 uint64_t last_saved_cold = 0;
 uint64_t last_saved_hot  = 0;
 uint32_t last_save_ms = 0;
+uint32_t save_every_ms = DEFAULT_SAVE_EVERY_MS;
+uint32_t save_every_pulses = DEFAULT_SAVE_EVERY_PULSES;
+
+// report settings/state
+bool report_enabled = false;
+String report_url = "";
+String device_token = "esp32-water-1";
+uint64_t last_reported_cold = 0;
+uint64_t last_reported_hot = 0;
 
 static inline uint32_t nowMs() { return (uint32_t)(micros() / 1000ULL); }
+
+String urlEncode(const String& s) {
+  static const char *hex = "0123456789ABCDEF";
+  String out;
+  out.reserve(s.length() * 3);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if ((c >= 'a' && c <= 'z') ||
+        (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') ||
+        c == '-' || c == '_' || c == '.' || c == '~') {
+      out += c;
+    } else {
+      out += '%';
+      out += hex[(c >> 4) & 0x0F];
+      out += hex[c & 0x0F];
+    }
+  }
+  return out;
+}
 
 // ====== ISR: только отметить кандидата ======
 void IRAM_ATTR isrCold() {
@@ -118,21 +153,96 @@ uint64_t parseCentiM3ToPulses(const String& s_in) {
   return centi_m3;
 }
 
+bool postReadings(bool force) {
+  bool send_enabled;
+  String send_url;
+  String send_token;
+
+  if (report_cfg_mutex != nullptr) {
+    xSemaphoreTake(report_cfg_mutex, portMAX_DELAY);
+  }
+  send_enabled = report_enabled;
+  send_url = report_url;
+  send_token = device_token;
+  if (report_cfg_mutex != nullptr) {
+    xSemaphoreGive(report_cfg_mutex);
+  }
+
+  if (!send_enabled || send_url.length() == 0) return false;
+
+  uint64_t c, h;
+  portENTER_CRITICAL(&mux);
+  c = cold_pulses;
+  h = hot_pulses;
+  portEXIT_CRITICAL(&mux);
+
+  if (!force) {
+    if (c == last_reported_cold && h == last_reported_hot) return false;
+  }
+
+  String fullUrl = send_url;
+  fullUrl += (send_url.indexOf('?') >= 0) ? '&' : '?';
+  fullUrl += "token=" + urlEncode(send_token);
+  uint64_t cold_liters = c * (uint64_t)LITERS_PER_PULSE;
+  uint64_t hot_liters  = h * (uint64_t)LITERS_PER_PULSE;
+  fullUrl += "&cold=" + String((unsigned long long)cold_liters);
+  fullUrl += "&hot=" + String((unsigned long long)hot_liters);
+
+  HTTPClient http;
+  http.begin(fullUrl);
+  int code = http.POST("");
+  String resp = http.getString();
+  http.end();
+
+  if (code > 0 && code < 400) {
+    last_reported_cold = c;
+    last_reported_hot = h;
+    Serial.println("POST OK: " + String(code));
+    return true;
+  }
+
+  Serial.println("POST FAIL: " + String(code) + " body=" + resp);
+  return false;
+}
+
+bool enqueueReportEvent(uint8_t eventType) {
+  if (report_queue == nullptr) return false;
+  return xQueueOverwrite(report_queue, &eventType) == pdTRUE;
+}
+
+void reportTask(void* arg) {
+  (void)arg;
+  uint8_t eventType = REPORT_EVENT_CHANGED;
+
+  for (;;) {
+    if (xQueueReceive(report_queue, &eventType, portMAX_DELAY) == pdTRUE) {
+      postReadings(eventType == REPORT_EVENT_FORCE);
+    }
+  }
+}
+
 // ====== NVS ======
 void loadState() {
   prefs.begin("water", true);
   cold_pulses = prefs.getULong64("cold", 0);
   hot_pulses  = prefs.getULong64("hot",  0);
   debounce_ms = prefs.getUInt("deb", DEFAULT_DEBOUNCE_MS);
+  save_every_ms = prefs.getUInt("save_ms", DEFAULT_SAVE_EVERY_MS);
+  save_every_pulses = prefs.getUInt("save_p", DEFAULT_SAVE_EVERY_PULSES);
+  report_url = prefs.getString("rep_url", "");
+  report_enabled = prefs.getBool("rep_on", false);
+  device_token = prefs.getString("dev_tok", "esp32-water-1");
   prefs.end();
 
   last_saved_cold = cold_pulses;
   last_saved_hot  = hot_pulses;
+  last_reported_cold = cold_pulses;
+  last_reported_hot = hot_pulses;
 }
 
 void saveState(bool force) {
   uint32_t now = millis();
-  if (!force && (now - last_save_ms) < SAVE_EVERY_MS) return;
+  if (!force && (now - last_save_ms) < save_every_ms) return;
 
   uint64_t c, h;
   portENTER_CRITICAL(&mux);
@@ -144,6 +254,17 @@ void saveState(bool force) {
   prefs.putULong64("cold", c);
   prefs.putULong64("hot",  h);
   prefs.putUInt("deb", debounce_ms);
+  prefs.putUInt("save_ms", save_every_ms);
+  prefs.putUInt("save_p", save_every_pulses);
+  if (report_cfg_mutex != nullptr) {
+    xSemaphoreTake(report_cfg_mutex, portMAX_DELAY);
+  }
+  prefs.putString("rep_url", report_url);
+  prefs.putBool("rep_on", report_enabled);
+  prefs.putString("dev_tok", device_token);
+  if (report_cfg_mutex != nullptr) {
+    xSemaphoreGive(report_cfg_mutex);
+  }
   prefs.end();
 
   last_save_ms = now;
@@ -152,7 +273,7 @@ void saveState(bool force) {
 }
 
 // ====== Фильтр одного канала ======
-void processChannel(
+bool processChannel(
   int pin,
   volatile bool &pending,
   volatile uint32_t &pending_at,
@@ -162,6 +283,7 @@ void processChannel(
   volatile uint64_t &pulses
 ) {
   uint32_t t = nowMs();
+  bool accepted = false;
 
   // подтвердить импульс: LOW держится >= LOW_CONFIRM_MS
   if (pending) {
@@ -178,6 +300,7 @@ void processChannel(
         portEXIT_CRITICAL(&mux);
 
         last_accept = t;
+        accepted = true;
       }
     } else {
       // вернулось в HIGH раньше подтверждения => мусор
@@ -199,6 +322,8 @@ void processChannel(
       high_since = 0;
     }
   }
+
+  return accepted;
 }
 
 // ====== BOT ======
@@ -217,12 +342,22 @@ String statusText() {
   portEXIT_CRITICAL(&mux);
 
   String s;
-  s.reserve(700);
+  s.reserve(1000);
   s += "Показания (м³):\n";
   s += "Холодная: " + pulsesToM3String3(c) + "\n";
   s += "Горячая : " + pulsesToM3String3(h) + "\n";
   s += "\nPulses: cold=" + String((unsigned long long)c) + " hot=" + String((unsigned long long)h) + "\n";
   s += "deb(ms)=" + String(debounce_ms) + "  LOW>=" + String(LOW_CONFIRM_MS) + "ms  HIGH>=" + String(HIGH_REARM_MS) + "ms\n";
+  s += "save: every_ms=" + String(save_every_ms) + " every_pulses=" + String(save_every_pulses) + "\n";
+  if (report_cfg_mutex != nullptr) {
+    xSemaphoreTake(report_cfg_mutex, portMAX_DELAY);
+  }
+  s += "send: " + String(report_enabled ? "ON" : "OFF") + "\n";
+  s += "send url: " + (report_url.length() ? report_url : String("<not set>")) + "\n";
+  s += "device token: " + device_token + "\n";
+  if (report_cfg_mutex != nullptr) {
+    xSemaphoreGive(report_cfg_mutex);
+  }
   s += "PIN: cold=" + String(digitalRead(PIN_COLD)) + " hot=" + String(digitalRead(PIN_HOT)) + "\n";
   s += "IRQ: cold=" + String(ci) + " hot=" + String(hi) + "\n";
   return s;
@@ -256,6 +391,116 @@ void newMsg(FB_msg& msg) {
     return;
   }
 
+  if (tl.startsWith("/savecfg")) {
+    int p1 = tl.indexOf(' ');
+    int p2 = (p1 >= 0) ? tl.indexOf(' ', p1 + 1) : -1;
+    if (p1 < 0 || p2 < 0) {
+      bot.sendMessage("Пример: /savecfg ms 60000 или /savecfg pulses 3");
+      return;
+    }
+    String key = tl.substring(p1 + 1, p2);
+    uint32_t val = (uint32_t)tl.substring(p2 + 1).toInt();
+
+    if (key == "ms") {
+      if (val < 1000 || val > 86400000UL) {
+        bot.sendMessage("save ms: диапазон 1000..86400000");
+        return;
+      }
+      save_every_ms = val;
+      saveState(true);
+      bot.sendMessage("OK save_every_ms=" + String(save_every_ms));
+      return;
+    }
+
+    if (key == "pulses") {
+      if (val < 1 || val > 1000) {
+        bot.sendMessage("save pulses: диапазон 1..1000");
+        return;
+      }
+      save_every_pulses = val;
+      saveState(true);
+      bot.sendMessage("OK save_every_pulses=" + String(save_every_pulses));
+      return;
+    }
+
+    bot.sendMessage("Неизвестный параметр. Используй: ms или pulses");
+    return;
+  }
+
+  if (tl.startsWith("/sendurl")) {
+    int sp = t.indexOf(' ');
+    if (sp < 0) { bot.sendMessage("Пример: /sendurl https://host/path"); return; }
+    String v = t.substring(sp + 1);
+    v.trim();
+    if (v.length() < 8) { bot.sendMessage("URL слишком короткий"); return; }
+    if (report_cfg_mutex != nullptr) {
+      xSemaphoreTake(report_cfg_mutex, portMAX_DELAY);
+    }
+    report_url = v;
+    if (report_cfg_mutex != nullptr) {
+      xSemaphoreGive(report_cfg_mutex);
+    }
+    enqueueReportEvent(REPORT_EVENT_CHANGED);
+    saveState(true);
+    bot.sendMessage("OK send url set");
+    return;
+  }
+
+  if (tl.startsWith("/send ")) {
+    String arg = tl.substring(6);
+    arg.trim();
+    bool enabledNow = false;
+    if (report_cfg_mutex != nullptr) {
+      xSemaphoreTake(report_cfg_mutex, portMAX_DELAY);
+    }
+    if (arg == "on") report_enabled = true;
+    else if (arg == "off") report_enabled = false;
+    else {
+      if (report_cfg_mutex != nullptr) {
+        xSemaphoreGive(report_cfg_mutex);
+      }
+      bot.sendMessage("Пример: /send on или /send off");
+      return;
+    }
+    enabledNow = report_enabled;
+    if (report_cfg_mutex != nullptr) {
+      xSemaphoreGive(report_cfg_mutex);
+    }
+    enqueueReportEvent(REPORT_EVENT_CHANGED);
+    saveState(true);
+    bot.sendMessage("OK send=" + String(enabledNow ? "ON" : "OFF"));
+    return;
+  }
+
+
+  if (tl.startsWith("/token")) {
+    int sp = t.indexOf(' ');
+    if (sp < 0) { bot.sendMessage("Пример: /token device-001"); return; }
+    String v = t.substring(sp + 1);
+    v.trim();
+    if (v.length() == 0 || v.length() > 120) {
+      bot.sendMessage("Токен: длина 1..120");
+      return;
+    }
+    if (report_cfg_mutex != nullptr) {
+      xSemaphoreTake(report_cfg_mutex, portMAX_DELAY);
+    }
+    device_token = v;
+    if (report_cfg_mutex != nullptr) {
+      xSemaphoreGive(report_cfg_mutex);
+    }
+    enqueueReportEvent(REPORT_EVENT_CHANGED);
+    saveState(true);
+    bot.sendMessage("OK token updated");
+    return;
+  }
+
+  if (tl == "/sendnow") {
+    enqueueReportEvent(REPORT_EVENT_FORCE);
+    bot.sendMessage("POST queued");
+    return;
+  }
+
   // /set cold 5464  (54.64 м³, только целые)
   if (tl.startsWith("/set")) {
     int p1 = tl.indexOf(' ');
@@ -284,6 +529,7 @@ void newMsg(FB_msg& msg) {
     portEXIT_CRITICAL(&mux);
 
     saveState(true);
+    enqueueReportEvent(REPORT_EVENT_CHANGED);
     bot.sendMessage("OK.\n" + statusText());
     return;
   }
@@ -298,6 +544,12 @@ void newMsg(FB_msg& msg) {
     "Команды:\n"
     "/get или /status — показания\n"
     "/deb N — мин. интервал между тиками (50..20000 мс)\n"
+    "/savecfg ms N — как часто писать в память по времени (1000..86400000)\n"
+    "/savecfg pulses N — как часто писать в память по импульсам (1..1000)\n"
+    "/sendurl URL — URL для POST\n"
+    "/send on|off — включить/выключить отправку\n"
+    "/token VALUE — токен устройства\n"
+    "/sendnow — отправить показания сразу\n"
     "/set cold 5464 — установить (54.64 м³), только целые\n"
     "/set hot 2882 — установить (28.82 м³), только целые\n"
     "/diag — диагностика\n"
@@ -327,6 +579,9 @@ void setup() {
 
   connectWiFi();
 
+  report_cfg_mutex = xSemaphoreCreateMutex();
+  report_queue = xQueueCreate(1, sizeof(uint8_t));
+
   bot.setChatID(ADMIN_CHAT_ID);
   bot.attach(newMsg);
 
@@ -335,14 +590,17 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(PIN_COLD), isrCold, FALLING);
   attachInterrupt(digitalPinToInterrupt(PIN_HOT),  isrHot,  FALLING);
 
+  xTaskCreatePinnedToCore(reportTask, "reportTask", 6144, nullptr, 1, nullptr, 1);
+
   bot.sendMessage("Старт.\n" + statusText());
 }
 
 void loop() {
   bot.tick();
 
-  processChannel(PIN_COLD, cold_pending, cold_pending_at, cold_armed, cold_high_since, cold_last_accept, cold_pulses);
-  processChannel(PIN_HOT,  hot_pending,  hot_pending_at,  hot_armed,  hot_high_since,  hot_last_accept,  hot_pulses);
+  bool coldAccepted = processChannel(PIN_COLD, cold_pending, cold_pending_at, cold_armed, cold_high_since, cold_last_accept, cold_pulses);
+  bool hotAccepted = processChannel(PIN_HOT,  hot_pending,  hot_pending_at,  hot_armed,  hot_high_since,  hot_last_accept,  hot_pulses);
+  if (coldAccepted || hotAccepted) enqueueReportEvent(REPORT_EVENT_CHANGED);
 
   // Сохранение по изменениям
   uint64_t c, h;
@@ -354,7 +612,7 @@ void loop() {
   uint64_t dc = (c > last_saved_cold) ? (c - last_saved_cold) : 0;
   uint64_t dh = (h > last_saved_hot)  ? (h - last_saved_hot)  : 0;
 
-  if ((dc + dh) >= SAVE_EVERY_PULSES) saveState(true);
+  if ((dc + dh) >= save_every_pulses) saveState(true);
   else if ((dc + dh) > 0) saveState(false);
 
   delay(10);
